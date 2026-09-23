@@ -9,8 +9,12 @@
 ## 可执行优化顺序
 
 1. 网关已经实现有界队列和单 worker：最多保留 8 个任务，超过上限返回 HTTP 429；同一 TP runtime 只有一个任务进入 `TensorParallel.forward`。任务状态保存网关 job UUID、Comfy prompt UUID、`queued/submitting/running/completed/failed`、当前 step 和更新时间。
-2. 通过 batch 提高吞吐。把相同尺寸、steps 的请求按短时间窗口聚合成 batch，再让四卡一次计算多个样本；当前 `forward` 已读取 batch 维，但 gateway 固定 `batch_size=1`，需要在调度层分桶并把结果拆回各 job。batch=2/4 要在 16GB V100 上实测。
-3. 减少每个 block 的同步与拷贝。`parallel()` 目前把完整 hidden state 复制到四张卡，并把后三个结果依次搬回 `cuda:0`；后续可使用每 rank 的 CUDA stream、GPU peer copy 和树形归约，但每次变更必须以固定 seed 做 dense/TP RMSE 回归。
+2. 通过 batch 提高吞吐。网关支持显式 `n` 参数：同一请求的多张图会放入一个 latent batch，避免
+   重入同一个 TP runtime。默认 `QWEN_MAX_BATCH_PIXELS=4MP`，因此 512² 可
+   `n=4`、1024² 可 `n=2`，2048² 仍只能 `n=1`。这是保守的显存门槛，部署时
+   应用固定 seed 对各分辨率的 batch=1/2/4 做实测后再调高；当前实测 1024²、4
+   steps 的 `n=1/4` 分别约 4.0/15.1 秒。
+3. 减少每个 block 的同步与拷贝。当前默认通过 `QWEN_TP_FUSED_QKV=1` 把每个 rank 的 Q/K/V 合并成一次 GEMM，并用 `QWEN_TP_REDUCE=comm` 的 `torch.cuda.comm.reduce_add` 做 NCCL/NVLink 归约；没有 NCCL 时会自动回退 P2P。两个变量分别设为 `0` 和 `loop` 可恢复旧路径，便于固定 seed 做 dense/TP RMSE 与端到端耗时 A/B。`parallel()` 仍把完整 hidden state 复制到四张卡；如果 profile 显示拷贝占比明显，再实验每 rank CUDA stream，避免默认打开导致额外事件同步。
 4. 服务启动后做一次 1-step 512² warmup，保持 TP runtime 和权重 shard 常驻，避免首请求解量化；同时关注 CUDA allocator 碎片，不能在请求间重建 `TensorParallel`。
 
 ## 高分辨率

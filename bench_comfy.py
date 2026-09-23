@@ -61,7 +61,7 @@ def run_benchmark(args):
     """Return (record_path, record); timeouts leave the remote job running."""
     from gateway import workflow
 
-    body = {"prompt": args.prompt, "size": args.size, "steps": args.steps, "seed": args.seed}
+    body = {"prompt": args.prompt, "size": args.size, "steps": args.steps, "seed": args.seed, "n": args.n}
     graph, seed = workflow(body)
     run_id = f"{args.prefix}_{dt.datetime.now(dt.timezone.utc):%Y%m%dT%H%M%S}_{uuid.uuid4().hex[:8]}"
     graph["8"]["inputs"]["filename_prefix"] = run_id
@@ -161,6 +161,7 @@ def main(argv=None):
     parser.add_argument("--url", default="http://127.0.0.1:8188", help="ComfyUI base URL (not the 8190 gateway)")
     parser.add_argument("--size", default="512x512", help="WIDTHxHEIGHT; the gateway workflow validates 8-pixel alignment and limits")
     parser.add_argument("--steps", type=int, default=4)
+    parser.add_argument("--n", type=int, default=1, help="number of same-prompt images in one latent batch")
     parser.add_argument("--seed", type=int, default=42, help="-1 chooses a random seed; repeated seeds may reuse ComfyUI's sampler cache")
     parser.add_argument("--prompt", default="a ceramic teapot on a wooden table, soft natural light, detailed photograph")
     parser.add_argument("--out-dir", default=str(Path(__file__).resolve().parent / "outputs"))

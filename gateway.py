@@ -22,13 +22,16 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import shutil
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
 COMFY = os.getenv("COMFY_URL", "http://127.0.0.1:8188").rstrip("/")
 ROOT = Path(__file__).parent
-PUBLIC_BASE_PATH = os.getenv("QWEN_PUBLIC_BASE_PATH", "/qwen-image-ui").rstrip("/") or ""
+# Keep links valid for the default direct listener. Reverse proxies that mount
+# the UI below a prefix can set QWEN_PUBLIC_BASE_PATH explicitly.
+PUBLIC_BASE_PATH = os.getenv("QWEN_PUBLIC_BASE_PATH", "").rstrip("/") or ""
 
 
 def _positive_int(name, default, minimum, maximum):
@@ -44,6 +47,15 @@ def _positive_int(name, default, minimum, maximum):
 MAX_PENDING = _positive_int("QWEN_GATEWAY_MAX_PENDING", 8, 1, 128)
 WORKERS = _positive_int("QWEN_GATEWAY_WORKERS", 1, 1, 8)
 MAX_PIXELS = _positive_int("QWEN_MAX_PIXELS", 4 * 1024 * 1024, 256 * 256, 16 * 1024 * 1024)
+# A batch executes in one ComfyUI graph.  Its activation footprint scales with
+# both image pixels and batch size, so keep a separate budget instead of
+# allowing ``n`` to multiply the single-image limit silently.  The default
+# permits four 512px images or two 1024px images while leaving 2048px jobs at
+# batch size one.
+MAX_BATCH_PIXELS = _positive_int(
+    "QWEN_MAX_BATCH_PIXELS", 4 * 1024 * 1024, 256 * 256, 64 * 1024 * 1024,
+)
+MAX_BATCH_SIZE = _positive_int("QWEN_MAX_BATCH_SIZE", 4, 1, 8)
 MAX_DIMENSION = _positive_int("QWEN_MAX_DIMENSION", 2048, 256, 8192)
 MAX_STEPS = _positive_int("QWEN_MAX_STEPS", 50, 1, 200)
 JOB_TIMEOUT = _positive_int("QWEN_JOB_TIMEOUT_SECONDS", 2 * 60 * 60, 60, 24 * 60 * 60)
@@ -148,6 +160,29 @@ def _parse_size(value):
     return width, height, f"{width}x{height}"
 
 
+def _parse_batch_size(value, width, height):
+    """Validate OpenAI-compatible ``n`` without allowing an accidental OOM.
+
+    ``n`` is implemented as one ComfyUI latent batch, which avoids loading a
+    second TP runtime and lets a single request use all four GPUs efficiently.
+    The budget is deliberately independent from ``MAX_PIXELS``: a normal
+    single-image request keeps the existing limit, while multi-image jobs are
+    admitted only when their estimated activation size is within the batch
+    budget.
+    """
+    batch = _as_int(value, "n")
+    if not 1 <= batch <= MAX_BATCH_SIZE:
+        raise ValueError(f"n 应为 1–{MAX_BATCH_SIZE}")
+    total_pixels = width * height * batch
+    if total_pixels > MAX_BATCH_PIXELS:
+        max_mp = MAX_BATCH_PIXELS / 1_000_000
+        raise ValueError(
+            f"n×图片像素不能超过 {MAX_BATCH_PIXELS:,}（约 {max_mp:.1f}MP），"
+            "请降低 n 或分辨率"
+        )
+    return batch
+
+
 def workflow(body):
     prompt = body.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 6000:
@@ -155,6 +190,7 @@ def workflow(body):
     if body.get("model", "qwen-image-2.1") != "qwen-image-2.1":
         raise ValueError("model 必须为 qwen-image-2.1")
     width, height, _ = _parse_size(body.get("size", "1024x1024"))
+    batch_size = _parse_batch_size(body.get("n", 1), width, height)
     steps = _as_int(body.get("steps", 25), "steps")
     seed = _as_int(body.get("seed", -1), "seed")
     if not 1 <= steps <= MAX_STEPS or not -1 <= seed <= 2**53 - 1:
@@ -170,7 +206,7 @@ def workflow(body):
         "2": n("CLIPLoader", clip_name="qwen3vl_8b_int8_convrot.safetensors", type="qwen_image", device="default"),
         "3": n("VAELoader", vae_name="qwen_image_2.1_vae_bf16.safetensors"),
         "4": n("TextEncodeQwenImage21", clip=["2", 0], prompt=prompt.strip(), negative_prompt="", resolution=1024),
-        "5": n("EmptyLatentImage", width=width, height=height, batch_size=1),
+        "5": n("EmptyLatentImage", width=width, height=height, batch_size=batch_size),
         "6": n("KSampler", model=["1", 0], positive=["4", 0], negative=["4", 1], latent_image=["5", 0],
                seed=seed, steps=steps, cfg=1.0, sampler_name="euler", scheduler="simple", denoise=1.0),
         "7": n("VAEDecode", samples=["6", 0], vae=["3", 0]),
@@ -437,11 +473,12 @@ def ensure_workers():
         WORKERS_STARTED = True
 
 
-def _new_job(graph, seed, steps):
+def _new_job(graph, seed, steps, batch_size=1):
     ensure_workers()
     job_id = str(uuid.uuid4())
     state = {
         "id": job_id, "graph": graph, "seed": seed, "steps": steps,
+        "batch_size": batch_size,
         "status": "queued", "progress": {"current": 0, "total": steps, "node": None},
         "images": [], "created": _now(), "updated": _now(),
     }
@@ -462,6 +499,8 @@ def _new_job(graph, seed, steps):
 
 def _public_job(state):
     response = {"status": state.get("status", "unknown"), "progress": dict(state.get("progress") or {})}
+    if state.get("batch_size", 1) != 1:
+        response["n"] = state["batch_size"]
     if state.get("status") == "completed":
         response["data"] = [{"url": "image?" + urllib.parse.urlencode(image)} for image in state.get("images", [])]
     if state.get("status") == "failed":
@@ -488,6 +527,17 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header(name, str(value))
         self.end_headers()
         self.wfile.write(raw)
+
+    def stream_image(self, response):
+        """Proxy an image without buffering a multi-megapixel PNG in RAM."""
+        self.send_response(200)
+        self.send_header("Content-Type", response.headers.get("Content-Type", "image/png"))
+        content_length = response.headers.get("Content-Length")
+        if content_length:
+            self.send_header("Content-Length", content_length)
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        shutil.copyfileobj(response, self.wfile, length=64 * 1024)
 
     @staticmethod
     def _valid_job_id(value):
@@ -534,7 +584,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self.reply(400, {"error": "无效图片"})
                 query = urllib.parse.urlencode({"filename": filename, "type": "output", "subfolder": ""})
                 with urllib.request.urlopen(COMFY + "/view?" + query, timeout=30) as response:
-                    return self.reply(200, response.read(), response.headers.get("Content-Type", "image/png"))
+                    return self.stream_image(response)
             return self.reply(404, {"error": "not found"})
         except urllib.error.HTTPError as exc:
             return self.reply(502, {"error": f"ComfyUI HTTP {exc.code}"})
@@ -555,10 +605,14 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(body, dict):
                 raise ValueError("请求必须为 JSON 对象")
             graph, seed = workflow(body)
-            state = _new_job(graph, seed, _as_int(body.get("steps", 25), "steps"))
+            batch_size = int(graph["5"]["inputs"].get("batch_size", 1))
+            state = _new_job(
+                graph, seed, _as_int(body.get("steps", 25), "steps"), batch_size,
+            )
             self.reply(202, {
                 "created": int(state["created"]), "id": state["id"], "job_id": state["id"],
-                "seed": seed, "status": "queued", "status_url": PUBLIC_BASE_PATH + "/jobs/" + state["id"],
+                "seed": seed, "n": batch_size, "status": "queued",
+                "status_url": PUBLIC_BASE_PATH + "/jobs/" + state["id"],
                 "progress": state["progress"], "queue_limit": MAX_PENDING,
             })
         except QueueLimitError as exc:
@@ -572,13 +626,26 @@ class Handler(BaseHTTPRequestHandler):
         return super().log_message(format, *args)
 
 
+class GatewayHTTPServer(ThreadingHTTPServer):
+    """HTTP listener with enough kernel backlog for bursty API clients.
+
+    ``HTTPServer`` defaults to a listen backlog of five.  That is easy to hit
+    when a frontend refreshes while several workers poll job status, causing
+    otherwise valid submissions to fail before they reach the bounded job
+    queue.  The application queue is still the admission-control boundary;
+    this only prevents the TCP accept backlog from becoming an accidental one.
+    """
+
+    request_queue_size = max(64, MAX_PENDING * 4)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default=os.getenv("GATEWAY_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(os.getenv("GATEWAY_PORT", "8190")))
     args = parser.parse_args()
     ensure_workers()
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    server = GatewayHTTPServer((args.host, args.port), Handler)
     server.daemon_threads = True
     server.serve_forever()
 

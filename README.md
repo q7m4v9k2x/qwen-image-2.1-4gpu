@@ -30,9 +30,13 @@ export QWEN_TP=1
 export QWEN_TP_ROOT=/path/to/qwen2.1-4gpu
 export QWEN_TP_DEVICES=0,1,2,3
 export CUDA_VISIBLE_DEVICES=0,1,2,3
+export QWEN_TP_FUSED_QKV=1
+export QWEN_TP_REDUCE=comm
 ```
 
-`QWEN_TP_ROOT` 是本项目目录，不应写死为某台机器的路径。也可以从 ComfyUI 目录运行 `serve_comfyui.multigpu.sh`，通过 `COMFYUI_ROOT` 和 `QWEN_TP_ROOT` 覆盖默认位置。将 `QWEN_TP=0` 或移除 custom node 即可回到原生路径。
+`QWEN_TP_ROOT` 是本项目目录，不应写死为某台机器的路径。也可以从 ComfyUI 目录运行 `serve_comfyui.multigpu.sh`，通过 `COMFYUI_ROOT` 和 `QWEN_TP_ROOT` 覆盖默认位置。启动脚本未显式设置 `CUDA_VISIBLE_DEVICES` 时，会优先选择显存至少 12 GiB 的前四张卡，避免把小型显示卡混入四卡 TP；也可以手动指定物理卡。将 `QWEN_TP=0` 或移除 custom node 即可回到原生路径。
+
+默认将 Q/K/V 投影合并为一次 GEMM，并用 `torch.cuda.comm.reduce_add` 做跨卡归约；前者可通过 `QWEN_TP_FUSED_QKV=0` 关闭，后者可通过 `QWEN_TP_REDUCE=loop` 强制使用旧的逐卡归约，便于固定 seed 做回归和性能 A/B 测试。没有 NCCL 的构建会自动回退到 P2P 归约。
 
 启动网关：
 
@@ -42,7 +46,7 @@ GATEWAY_HOST=127.0.0.1 GATEWAY_PORT=8190 \
 python gateway.py
 ```
 
-网关应放在反向代理、内网或授权 VPN 后面；不要把 ComfyUI 或网关端口直接暴露到公网。生产部署、队列上限和高分辨率策略见 [DEPLOYMENT.md](DEPLOYMENT.md)。
+网关应放在反向代理、内网或授权 VPN 后面；不要把 ComfyUI 或网关端口直接暴露到公网。生产部署、队列上限和高分辨率策略见 [DEPLOYMENT.md](DEPLOYMENT.md) 及 [HIGH-RESOLUTION.md](HIGH-RESOLUTION.md)。
 
 ## API
 
@@ -53,6 +57,18 @@ curl -X POST http://127.0.0.1:8190/v1/images/generations \
   -H 'Content-Type: application/json' \
   -d '{"model":"qwen-image-2.1","prompt":"雨后的森林书屋，温暖灯光，水彩插画","size":"1024x1024","steps":25,"seed":42}'
 ```
+
+需要一次生成多张相同提示词的图片时可设置 `n`。网关会把它们合并为一个
+ComfyUI latent batch，四张卡共同执行一次，完成后在 `data` 中返回多张图片：
+
+```json
+{"model":"qwen-image-2.1","prompt":"雨后的森林书屋","size":"512x512","steps":4,"n":4}
+```
+
+`n` 默认是 1，最大值和批量总像素预算可通过 `QWEN_MAX_BATCH_SIZE`、
+`QWEN_MAX_BATCH_PIXELS` 调整。默认批量预算为 4MP（例如 512²×4 或
+1024²×2）；2048² 请求只能使用 `n=1`。批量不会并行提交多个 TP 任务，
+因此不会重入共享的四卡运行时，也不会额外加载模型副本。
 
 响应为 HTTP 202，包含 `id`、`seed` 和 `status_url`。使用 `GET /jobs/{id}` 查询状态；返回 `completed` 时，`data[].url` 可直接下载图片。`progress.current` 和 `progress.total` 来自 ComfyUI 采样进度，不能把它当作精确剩余时间。
 
