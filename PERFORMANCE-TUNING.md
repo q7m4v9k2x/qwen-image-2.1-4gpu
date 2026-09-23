@@ -8,14 +8,14 @@
 
 ## 可执行优化顺序
 
-1. 在网关或扩展中增加全局 GPU 生成锁，最多允许一个 TP 任务进入 `TensorParallel.forward`；任务状态保存 `queued/admitted/running/saving/completed/failed/cancelled`、当前 step 和更新时间。建议初始队列上限 8，超出返回 429。
+1. 网关已经实现有界队列和单 worker：最多保留 8 个任务，超过上限返回 HTTP 429；同一 TP runtime 只有一个任务进入 `TensorParallel.forward`。任务状态保存网关 job UUID、Comfy prompt UUID、`queued/submitting/running/completed/failed`、当前 step 和更新时间。
 2. 通过 batch 提高吞吐。把相同尺寸、steps 的请求按短时间窗口聚合成 batch，再让四卡一次计算多个样本；当前 `forward` 已读取 batch 维，但 gateway 固定 `batch_size=1`，需要在调度层分桶并把结果拆回各 job。batch=2/4 要在 16GB V100 上实测。
 3. 减少每个 block 的同步与拷贝。`parallel()` 目前把完整 hidden state 复制到四张卡，并把后三个结果依次搬回 `cuda:0`；后续可使用每 rank 的 CUDA stream、GPU peer copy 和树形归约，但每次变更必须以固定 seed 做 dense/TP RMSE 回归。
 4. 服务启动后做一次 1-step 512² warmup，保持 TP runtime 和权重 shard 常驻，避免首请求解量化；同时关注 CUDA allocator 碎片，不能在请求间重建 `TensorParallel`。
 
 ## 高分辨率
 
-激活和 attention 随 latent token 数增长，显存/计算压力主要由 `width * height` 决定。API 应强制宽高为 8 的倍数、限制单边和总像素，并限制 steps；建议默认 512²、768²、1024²，1536² 先单独压测。2048² 及以上不要直接走全局 attention，使用“1024 基础图 + latent/像素分块放大”的两阶段流程；分块需 overlap 和边缘融合，并在文档中标注其全局构图与原生模式不同。
+激活和 attention 随 latent token 数增长，显存/计算压力主要由 `width * height` 决定。网关现在强制宽高为 8 的倍数、单边不超过 2048、总像素不超过 4,194,304，并限制 steps。工作站实测 1536² 和 2048² 的 4-step 任务均可完成；生产任务仍应先用低步数确认显存，再提高到 25–50 steps。超过 2048² 或 4MP 时应采用“基础图 + latent/像素分块放大”的两阶段流程，避免直接全局 attention。
 
 建议增加 `mode: base|hires`、`base_size`、`scale`、`tile_size`、`overlap`，给 hires 任务更低的并发权重。不要只放大像素上限，否则 OOM 会在采样中途发生。
 
