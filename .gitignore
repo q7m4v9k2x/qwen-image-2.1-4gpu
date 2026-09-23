@@ -1,0 +1,15 @@
+__pycache__/
+outputs/
+reference/
+remote.py
+smoke_remote.py
+monitor_gpu.py
+workstation.known_hosts
+model.py.original
+model.py.multigpu.py
+*.bak
+*.log
+*.known_hosts
+*.local.*
+.env
+.venv/
