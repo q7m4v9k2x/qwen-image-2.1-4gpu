@@ -45,6 +45,10 @@ python gateway.py
 `QWEN_PUBLIC_BASE_PATH=/qwen-image-ui`；直接访问 8190 时保持为空，API 返回的
 `status_url` 才会直接指向 `/jobs/{id}`。
 
+默认 `QWEN_CLIP_DEVICE=default` 将文本编码器放在 GPU 以获得更快的短任务响应。
+如果连续 2K 任务出现显存紧张，可设为 `QWEN_CLIP_DEVICE=cpu`，把约 8.9 GiB
+文本编码器移出 rank0；代价是首次文本编码更慢，适合高分辨率稳定性优先的部署。
+
 反向代理只转发网关端口，并限制来源网络。网关目前不提供用户鉴权；如果需要给多个调用方使用，请在前置代理加入认证、限流和请求大小限制。
 
 ## 3. 健康检查与故障排查

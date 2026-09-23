@@ -32,6 +32,9 @@ ROOT = Path(__file__).parent
 # Keep links valid for the default direct listener. Reverse proxies that mount
 # the UI below a prefix can set QWEN_PUBLIC_BASE_PATH explicitly.
 PUBLIC_BASE_PATH = os.getenv("QWEN_PUBLIC_BASE_PATH", "").rstrip("/") or ""
+CLIP_DEVICE = os.getenv("QWEN_CLIP_DEVICE", "default").strip().lower()
+if CLIP_DEVICE not in {"default", "cpu"}:
+    CLIP_DEVICE = "default"
 
 
 def _positive_int(name, default, minimum, maximum):
@@ -203,7 +206,7 @@ def workflow(body):
 
     return {
         "1": n("UNETLoader", unet_name="qwen_image_2.1_int8_convrot.safetensors", weight_dtype="default"),
-        "2": n("CLIPLoader", clip_name="qwen3vl_8b_int8_convrot.safetensors", type="qwen_image", device="default"),
+        "2": n("CLIPLoader", clip_name="qwen3vl_8b_int8_convrot.safetensors", type="qwen_image", device=CLIP_DEVICE),
         "3": n("VAELoader", vae_name="qwen_image_2.1_vae_bf16.safetensors"),
         "4": n("TextEncodeQwenImage21", clip=["2", 0], prompt=prompt.strip(), negative_prompt="", resolution=1024),
         "5": n("EmptyLatentImage", width=width, height=height, batch_size=batch_size),

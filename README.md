@@ -38,6 +38,9 @@ export QWEN_TP_REDUCE=comm
 
 默认将 Q/K/V 投影合并为一次 GEMM，并用 `torch.cuda.comm.reduce_add` 做跨卡归约；前者可通过 `QWEN_TP_FUSED_QKV=0` 关闭，后者可通过 `QWEN_TP_REDUCE=loop` 强制使用旧的逐卡归约，便于固定 seed 做回归和性能 A/B 测试。没有 NCCL 的构建会自动回退到 P2P 归约。
 
+网关默认把文本编码器放在 GPU（`QWEN_CLIP_DEVICE=default`）；高分辨率连续任务若需要给
+rank0 留显存，可设为 `cpu`，以文本编码时间换取约 8.9 GiB 的显存余量。
+
 启动网关：
 
 ```bash
